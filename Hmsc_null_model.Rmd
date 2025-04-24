@@ -1,0 +1,155 @@
+Siena Blier
+F24/W25 Honours Biology Research Project
+Hmsc Null Model & Comparison with Trait Model 
+Model Specs: 47 species, 150 sites, 1000 samples per chain, 2 chains *WITHOUT TRAIT DATA*
+
+Note: This script is very similar to Hmsc_build_model.Rmd, so it has fewer comments/explanations than that scripts (and, of course, no trait data!).
+
+# 0. Load Libraries
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(Hmsc)
+library(ggplot2)
+library(viridis)
+library(coda)
+library(grafify)
+library(corrplot)
+```
+
+# 1. Load Data
+
+Note that for the null model, we are not including the trait matrix. 
+
+```{r}
+
+# Species distribution data
+pa_matrix_input <- readRDS("Saved Files FINAL/pa_matrix_input.rds")
+
+# Site coordinates
+site_coords <- readRDS("Saved Files FINAL/site_coords.rds")
+
+# Phylogenetic data
+phylo_input <- readRDS("Saved Files FINAL/phylo_input.rds")
+
+# Climate data
+climate_input <- readRDS("Saved Files FINAL/climate_input.rds")
+
+```
+
+# 2. Build Model 
+
+We now specify the other parameters in HMSC. The formulas assume linear relationships between the response and predictor variables for simplicity. Again, we do not need to specify a formula for the traits for the null model. 
+
+```{r}
+XFormula = ~ PC1 + PC2 + PC3 # Assume species presence varies linearly with climate PCs
+
+```
+
+HMSC considers the spatial structure of the data, so we specify our study design.
+
+```{r}
+
+studyDesign <- data.frame(ID = as.factor(site_coords$SiteID))
+
+xy <- as.matrix(cbind(site_coords$Longitude, 
+                           site_coords$Latitude))
+rownames(xy) <- site_coords$SiteID
+colnames(xy) <- c("Longitude", "Latitude")
+
+rL = HmscRandomLevel(sData = xy) 
+```
+
+We are now ready to build the model!! We choose a probit distribution since we are working with presence-absence data. 
+
+```{r}
+m.null = Hmsc(Y = as.matrix(pa_matrix_input), distr = "probit", XData = climate_input, 
+              XFormula = XFormula,
+              C = as.matrix(phylo_input), studyDesign = studyDesign, ranLevels = list(ID = rL))
+```
+
+# 3. Fit Model 
+
+HMSC uses Bayesian statistics, specifically a Markov chain Monte Carlo algorithm. Let's start to "fit" the model in a very quick but inaccurate way, just to make sure there are no issues in how the model was built. 
+
+```{r}
+nChains = 2
+thin = 1
+samples = 10
+transient = 5
+verbose = 0
+
+m.null = sampleMcmc(m.null, thin = thin, samples = samples, transient = transient,
+                    nChains = nChains, nParallel = nChains, verbose = verbose)
+```
+
+That worked! Now let's change the parameters to fit the model more accurately. Here, we opt for 1000 samples per chain, discarding the first 1000 samples as transient This will take much longer to run, so plug in your computer!
+
+```{r}
+thin = 100
+samples = 1000
+transient = 1000 
+verbose = 0
+
+m.null = sampleMcmc(m.null, thin = thin, samples = samples, transient = transient,
+                    nChains = nChains, nParallel = nChains, verbose = verbose)
+
+
+saveRDS(m.null, file = "Saved Files FINAL/fitted_null_model.rds")
+```
+
+# 4. Evaluate Model 
+
+We first convert the parameter estimates from the HMSC object into a coda object, so that we can use the coda package (https://cran.r-project.org/web/packages/coda/index.html) to analyze the model output.
+
+```{r}
+mpost.null = convertToCodaObject(m.null) 
+saveRDS(mpost.null, "Saved Files FINAL/mpost.null.rds")
+```
+
+Let's look at a summary of the Beta values, which will give us each species' estimated coefficients for the 3 climatic variables (which in our case are the 3 climatic PCs). 47 species X 3 climate PCs = 141 Beta coeffients estimated. Each Beta coefficient value corresponds to the **average** over all the iterations of the MCMC sampling (2 chains*1000 samples per chain). 
+
+```{r}
+summary(mpost.null$Beta) # gives coefficients for fixed effects (climatic variables)
+mpost.null.Beta <- mpost.null$Beta # Make object of Beta estimates
+```
+
+# MCMC convergence diagnostics
+
+Before we look at the explanatory and predictive power of the model, we check that the MCMC sampling convergence was satisfactory. For a visual check, we can look at the posterior trace plots, which show the iterations of the sampling. Here, we look for chains that are well-mixed, consistent, and randomly exploring the space around the mean (check out the Hmsc vignettes for more info on this: https://github.com/hmsc-r/HMSC).
+
+```{r}
+# Look at trace plot for one species
+species_name <- "Sorex hoyi"
+indices <- grep(species_name, colnames(mpost.null.Beta[[1]]))
+beta_estimates_null <- mpost.null.Beta[, indices]
+traceplot(beta_estimates_null)
+```
+
+# Explanatory power
+
+Now we look at the Root Mean Square Error (RMSE), Tjur's R^2 (a.k.a. Tjur's D or Tjur's coefficient of determination) and Area Under the Curve (AUC) to assess the model's explanatory power. Lower values of RMSE show less error between observed and predicted values (i.e. higher explanatory power). Tjur's R^2 measures the discriminating power of the model. It is the difference between the sum of the probabilities of occurrence for the observed presences and the sum of the probabilities of occurrence for the observed absences (https://www.statease.com/docs/se360/contents/advanced-topics/glm/tjur-pseudo-r-squared/). A value of 1 indicates perfect discrimination between presences and absences; 0 indicates no discriminating power. The AUC is another metric of the model's discriminating power, with values above 0.80 indicating strong ability to discriminate between presences and absences, in this case (https://pmc.ncbi.nlm.nih.gov/articles/PMC10664195/#:~:text=When%20interpreting%20AUC%20values%2C%20it,AUC%20value%20is%20less%20reliable.).
+
+```{r}
+preds.null = computePredictedValues(m.null)
+model.fit.null = evaluateModelFit(hM=m.null, predY=preds.null)
+model.fit.null
+
+```
+
+# Predictive power
+
+We assess the predictive power of the model with two-fold cross-validation.
+
+```{r}
+partition.null = createPartition(m.null, nfolds = 2, column = "ID")
+cvpreds.null = computePredictedValues(m.null, partition=partition.null,
+                                      nParallel = nChains)
+
+cvMF.null = evaluateModelFit(hM=m.null, predY=cvpreds.null)
+cvMF.null
+saveRDS(cvMF.null, file = "Saved Files FINAL/crossval_results_null.rds")
+
+```
+

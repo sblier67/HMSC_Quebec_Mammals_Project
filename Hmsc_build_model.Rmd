@@ -1,0 +1,635 @@
+Siena Blier
+F24/W25 Honours Biology Research Project
+Hmsc Model Building & Fitting 
+Model Specs: 47 species, 150 sites, 1000 iterations per chain, 2 chains *WITH TRAIT DATA*
+
+Welcome back! Now that we've got all our data ready, let's build our HMSC. 
+
+# 0. Load Libraries
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(Hmsc)
+library(ggplot2)
+library(viridis)
+library(coda)
+library(grafify)
+library(corrplot)
+```
+
+# 1. Load Data
+
+```{r}
+
+# Species distribution data
+pa_matrix_input <- readRDS("Saved Files FINAL/pa_matrix_input.rds")
+
+# Site coordinates
+site_coords <- readRDS("Saved Files FINAL/site_coords.rds")
+
+# Species trait data
+trait_input <- readRDS("Saved Files FINAL/trait_input.rds")
+
+# Phylogenetic data
+phylo_input <- readRDS("Saved Files FINAL/phylo_input.rds")
+
+# Climate data
+climate_input <- readRDS("Saved Files FINAL/climate_input.rds")
+
+```
+
+# 2. Build Model 
+
+We now specify the parameters in HMSC. For simplicity, we use formulas that assume linear relationships between the response and predictor variables. 
+
+```{r}
+XFormula = ~ PC1 + PC2 + PC3 # Assume species presence varies linearly with climate PCs
+
+TrFormula = ~ Dim.1 + Dim.2 + Dim.3 # Assume species presence varies linearly with climate PCs
+```
+
+HMSC considers the spatial structure of the data, so we specify our study design (n = 150 sample sites).
+
+```{r}
+
+studyDesign <- data.frame(ID = as.factor(site_coords$SiteID))
+
+xy <- as.matrix(cbind(site_coords$Longitude, 
+                           site_coords$Latitude))
+rownames(xy) <- site_coords$SiteID
+colnames(xy) <- c("Longitude", "Latitude")
+
+rL = HmscRandomLevel(sData = xy) 
+```
+
+We are now ready to build the model!! We choose a **probit distribution** since we are working with presence-absence data. 
+
+```{r}
+m = Hmsc(Y = as.matrix(pa_matrix_input), distr = "probit", XData = climate_input, 
+              XFormula = XFormula, TrData = trait_input, TrFormula = TrFormula,
+              C = as.matrix(phylo_input), studyDesign = studyDesign, ranLevels = list(ID = rL))
+```
+
+# 3. Fit Model 
+
+HMSC uses Bayesian statistics, specifically a Markov chain Monte Carlo algorithm. Let's start by "fitting" the model in a very quick but inaccurate way, just to make sure there are no issues in how the model was built. 
+
+```{r}
+nChains = 2
+thin = 1
+samples = 10
+transient = 5
+verbose = 0
+
+m = sampleMcmc(m, thin = thin, samples = samples, transient = transient,
+                    nChains = nChains, nParallel = nChains, verbose = verbose)
+```
+
+That worked! Now let's change the parameters to fit the model more accurately. Here, we opt for 1000 samples per chain, discarding the first 1000 samples as transient. This will take much longer to run, so plug in your computer and consider using a command like "caffeinate -i" in your Terminal to make sure the code keeps running!
+
+```{r}
+thin = 100
+samples = 1000
+transient = 1000 
+verbose = 0
+
+m = sampleMcmc(m, thin = thin, samples = samples, transient = transient,
+                    nChains = nChains, nParallel = nChains, verbose = verbose)
+
+
+saveRDS(m, file = "Saved Files FINAL/fitted_model.rds")
+```
+
+# 4. Evaluate Model 
+
+We first convert the parameter estimates from the HMSC object into a coda object, so that we can use the coda package (https://cran.r-project.org/web/packages/coda/index.html) to analyze the model output.
+
+```{r}
+mpost = convertToCodaObject(m) 
+saveRDS(mpost, "Saved Files FINAL/mpost.rds")
+```
+
+Let's look at a summary of the Beta values, which will give us each species' estimated coefficients for the 3 climatic variables (which in our case are the 3 climatic PCs). 47 species X 3 climate PCs = 141 Beta coeffients estimated. Each Beta coefficient value corresponds to the **average** over all the iterations of the MCMC sampling (2 chains*1000 samples per chain). 
+
+```{r}
+summary(mpost$Beta) # gives coefficients for fixed effects (climatic variables)
+mpost.Beta <- mpost$Beta # Make object of Beta estimates
+```
+
+# MCMC convergence diagnostics
+
+Before we look at the explanatory and predictive power of the model, we check that the MCMC sampling convergence was satisfactory. For a visual check, we can look at the posterior trace plots, which show the iterations of the sampling. Here, we look for chains that are well-mixed, consistent, and randomly exploring the space around the mean (check out the Hmsc vignettes for more info on this: https://github.com/hmsc-r/HMSC).
+
+```{r}
+# Look at trace plot for one species (change as needed)
+species_name <- "Alces alces"
+indices <- grep(species_name, colnames(mpost.Beta[[1]]))
+beta_estimates <- mpost.Beta[, indices]
+traceplot(beta_estimates)
+```
+
+These trace plots indicate good convergence. Next, we look at the Effective Sample Size (ESS), which measures the number of independent samples (if this value is close to the actual number of samples, autocorrelation is low). The Gelman Diagnostic, or Potential Scale Reduction Factor (PSRF) compares within-chain and between-chain variance (if this value is close to 1, the two chains were consistent with each other, i.e. converged). We're looking for an ESS that is close to the total number of samples from the MCMC sampling.
+
+```{r}
+effectiveSize(mpost$Beta) # should be close to nChains*samples (in our case: 2000)
+gelman.diag(mpost$Beta,multivariate=FALSE)$psrf # should be close to 1
+```
+
+# Explanatory power
+
+Now we look at the Root Mean Square Error (RMSE), Tjur's R^2 (a.k.a. Tjur's D or Tjur's coefficient of determination) and Area Under the Curve (AUC) to assess the model's explanatory power. Lower values of RMSE show less error between observed and predicted values (i.e. higher explanatory power). Tjur's R^2 measures the discriminating power of the model. It is the difference between the sum of the probabilities of occurrence for the observed presences and the sum of the probabilities of occurrence for the observed absences (https://www.statease.com/docs/se360/contents/advanced-topics/glm/tjur-pseudo-r-squared/). A value of 1 indicates perfect discrimination between presences and absences; 0 indicates no discriminating power. The AUC is another metric of the model's discriminating power, with values above 0.80 indicating strong ability to discriminate between presences and absences, in this case (https://pmc.ncbi.nlm.nih.gov/articles/PMC10664195/#:~:text=When%20interpreting%20AUC%20values%2C%20it,AUC%20value%20is%20less%20reliable.).
+
+```{r}
+preds = computePredictedValues(m)
+model.fit = evaluateModelFit(hM=m, predY=preds)
+model.fit
+```
+
+Notice the variation in species' explanatory powers (this is to be expected).
+
+# Predictive power
+
+We assess the predictive power of the model with two-fold cross-validation.
+
+```{r}
+partition = createPartition(m, nfolds = 2, column = "ID")
+cvpreds = computePredictedValues(m, partition=partition,
+                                      nParallel = nChains)
+
+cvMF = evaluateModelFit(hM=m, predY=cvpreds)
+cvMF
+saveRDS(cvMF, file = "Saved Files FINAL/crossval_results.rds")
+
+```
+
+# 5. Explore Model Predictions
+
+Perhaps the most intuitive model output is the probability of presence of all the species for all the sites in the presence-absence matrix. Each MCMC sample estimates these probabilites. We can average these probabilities across all MCMC samples, and visualize this as a predicted species richness map. 
+
+```{r}
+# Average Presence-Absence matrix
+
+# Calculate the mean across the third dimension (iterations)
+preds.avg <- apply(preds, c(1, 2), mean)
+
+# Check the structure of the resulting matrix
+str(preds.avg)
+
+# Add row and column names for clarity (optional)
+rownames(preds.avg) <- dimnames(preds.avg)[[1]] # Site IDs
+colnames(preds.avg) <- dimnames(preds.avg)[[2]] # Species names
+
+# View the resulting presence-absence matrix
+head(preds.avg)
+
+# Make into matrix
+preds.avg <- as.matrix(preds.avg)
+```
+
+With the averaged model predictions, we can make a predicted SR map, and see if it's consistent with expected trends (and compare it to the SR map we made earlier with the observed presence-absence data).
+
+```{r}
+# Get roi shape file
+roi <- st_read("Saved Files FINAL/filtered_regions.shp")
+
+# Apply 0.8 threshold for species presence
+binary_matrix <- (preds.avg >= 0.8) * 1  # Converts to 1 (presence) or 0 (absence)
+head(binary_matrix)
+
+# Calculate SR for each site
+sr_df <- as.data.frame(rowSums(binary_matrix))
+colnames(sr_df) <- "SR"
+
+# Add SR to coords
+xy <- readRDS("Saved Files FINAL/site_coords.rds")
+sr_coords <- cbind(xy[,2:3], sr_df)
+
+# Plot
+ggplot() +
+  geom_sf(data = roi, fill = "lightgray", color = "black") +
+  geom_point(data = sr_coords, aes(x = Longitude, y = Latitude, color = SR), size = 2) +
+  scale_color_viridis_c() + 
+  labs(title = "Species Richness Across ROI", x = "Longitude", y = "Latitude", color = "SR") +
+  theme_classic() +
+  theme(legend.position = "right")
+# Troubleshooting tip: run dev.off() if getting "invalid graphics state" error
+```
+
+We can also look at the distribution for one species:
+
+```{r}
+# Make data frame for Dicrostonyx hudsonius (change species as needed)
+dhud.pred <- as.data.frame(cbind(xy, preds.avg[,7]))
+colnames(dhud.pred) <- c("Site ID", "Longitude", "Latitude", "Prob")
+
+# Plot
+ggplot() +
+  geom_sf(data = roi, fill = "lightgray", color = "black") +
+  geom_point(data = dhud.pred, aes(x = Longitude, y = Latitude, color = Prob), size = 2) +
+  scale_color_viridis_c() + 
+  labs(title = "D. hudsonius Distribution", x = "Longitude", y = "Latitude", color = "Prob") +
+  theme_classic() +
+  theme(legend.position = "right")
+```
+
+*Now I start to explore the model outputs to address my research questions.*
+
+# 6. Variance Partitioning
+
+We now look at how much variation is explained by the climate covariates, the random effects, and the traits. Since the 19 bioclimatic variables were reduced to 3 dimensions, rather than grouping them into distinct categories, we group three dimensions together (under the group "climate"), and look at the variance explained by climate vs random effects. 
+
+```{r}
+VP = computeVariancePartitioning(m, group = c(1,1,1,1), groupnames = c("climate"))
+```
+
+Here are two ways of visualizing the results: 
+
+1) With the function in Hmsc package
+```{r}
+par(mar = c(5, 15, 4, 7), mgp = c(12, 1, 0))
+plotVariancePartitioning(m, VP = VP, horiz = TRUE, args.legend = list(x = "right", inset = c(-0.28, 0), legend = c("Climate", "Random"))) 
+par(mgp = c(3, 1, 0))
+```
+
+2) Graphing directly with barplot (easier to customize)
+
+```{r}
+VP_vals <- as.matrix(VP$vals)
+par(mgp = c(3, 0.005, 0), mar = c(5, 8, 3, 4))
+barplot(VP_vals, horiz = TRUE, 
+        col = c("red", "yellow"), 
+        xlab = "Proportion of Variance", 
+        ylab = "", 
+        space = 0, 
+        border = "black",
+        legend.text = c("Climate", "Random"), 
+        args.legend = list(x = "right", inset = c(-0.2, 0)),
+        cex.names = 0.6, 
+        las = 1,
+        )
+
+```
+
+We can look at how much variation in the species' Beta parameters is explained by traits. Recall that the Beta parameters capture how species respond to the environmental covariates. 
+
+```{r XIV}
+knitr::kable(VP$R2T$Beta)
+```
+
+...and how much of the variation in species occurrence is explained by traits.
+
+```{r}
+VP$R2T$Y
+```
+
+Not much! On to the Beta parameters!
+
+# 7. Beta parameters
+
+We start with an overview of the Beta parameters (species niches), specifically the signs of the species' Betas for the 3 climate PCs. 
+
+```{r}
+postBeta = getPostEstimate(m, parName = "Beta")
+par(mgp = c(3, 0, 0), mar = c(5, 8, 3, 2))
+plotBeta(m, post = postBeta, param = "Sign",
+         plotTree = FALSE, supportLevel = 0.95, spNamesNumbers = c(T,F), covNamesNumbers = c(T,F), cex = c(1, 0.2, 1))
+```
+
+Let's explore the Betas for PC1, PC2, and PC3 in more detail: 
+
+# Plot PC1 Beta parameters
+
+First we organize the data in an appropriate format for ggplot. 
+
+```{r}
+
+# Identify the column indices for "PC1"
+pc1_indices <- grep("PC1", colnames(mpost[["Beta"]][[1]]))
+
+# Get list of species
+spp_list <- colnames(pa_matrix_input)
+
+# Extract Beta estimates for PC1 from both chains
+beta_pc1_chain1 <- as.data.frame(mpost[["Beta"]][[1]][, pc1_indices])
+colnames(beta_pc1_chain1) <- spp_list
+beta_pc1_chain2 <- as.data.frame(mpost[["Beta"]][[2]][, pc1_indices])
+colnames(beta_pc1_chain2) <- spp_list
+
+# Combine data from both chains of MCMC sampling
+beta_pc1 <- bind_rows(beta_pc1_chain1, beta_pc1_chain2, .id = "Chain") %>%
+  .[,2:ncol(.)]
+
+# Convert to long format for ggplot
+beta_pc1_long <- beta_pc1 %>%
+  pivot_longer(cols = everything(), names_to = "Species", values_to = "Beta_PC1")
+```
+
+Before plotting, let's calculate 95% credibility interval (CI)* to see which species have a Beta coefficient for PC1 that differs significantly from zero.
+
+*Since we are looking at posterior probability distributions, we use credible rather than confidence intervals.
+
+```{r}
+# Calculate 95% CIs
+beta_pc1_summary <- beta_pc1_long %>%
+  group_by(Species) %>%
+  summarise(
+    CI_low = quantile(Beta_PC1, 0.025),
+    CI_high = quantile(Beta_PC1, 0.975),
+    .groups = "drop"
+  ) %>%
+  mutate(significant = ifelse(CI_low > 0 | CI_high < 0, "*", NA))  # Star for significant results
+
+beta_pc1_summary
+prop_sig <- (47-sum(is.na(beta_pc1_summary$significant)))/47
+prop_sig
+```
+
+Now let's add in the species' taxonomic family, so we can colour our box-and-whisker plots by Family:
+
+```{r}
+# Add in families to colour by family 
+species_fams <- read.csv("COMBINE/COMBINE_archives/trait_data_imputed.csv") %>%
+  as.data.frame() %>%
+  filter(., iucn2020_binomial %in% spp_list) %>%
+  dplyr::select(., iucn2020_binomial, family)
+colnames(species_fams) <- c("Species", "Family")
+
+beta_pc1_long_fams <- merge(beta_pc1_long, species_fams, by = "Species")
+
+# Clean up environment
+rm(beta_pc1, beta_pc1_chain1, beta_pc1_chain2, beta_pc1_long)
+```
+
+Now we can plot the PC1 Beta coefficients:
+
+```{r}
+# Plot
+ggplot(beta_pc1_long_fams, aes(x = reorder(Species, Beta_PC1), y = Beta_PC1, fill = Family)) + 
+  geom_boxplot() + 
+  coord_flip() +
+  theme_classic() +
+  scale_colour_grafify(palette = "contrast") +
+  labs(y = "B1", x = "Species")
+```
+
+
+# Plot PC2 Beta parameters
+
+```{r}
+
+# Identify the column indices for "PC2"
+pc2_indices <- grep("PC2", colnames(mpost[["Beta"]][[1]]))
+
+# Extract Beta estimates for PC2 from both chains
+beta_pc2_chain1 <- as.data.frame(mpost[["Beta"]][[1]][, pc2_indices])
+colnames(beta_pc2_chain1) <- spp_list
+beta_pc2_chain2 <- as.data.frame(mpost[["Beta"]][[2]][, pc2_indices])
+colnames(beta_pc2_chain2) <- spp_list
+
+# Combine data from both chains of MCMC sampling
+beta_pc2 <- bind_rows(beta_pc2_chain1, beta_pc2_chain2, .id = "Chain") %>%
+  .[,2:ncol(.)]
+
+# Convert to long format for ggplot
+beta_pc2_long <- beta_pc2 %>%
+  pivot_longer(cols = everything(), names_to = "Species", values_to = "Beta_PC2")
+```
+
+Calculate 95% CI:
+
+# 95% CI PC2 Beta estimates
+
+```{r}
+# Calculate 95% CIs
+beta_pc2_summary <- beta_pc2_long %>%
+  group_by(Species) %>%
+  summarise(
+    CI_low = quantile(Beta_PC2, 0.025),
+    CI_high = quantile(Beta_PC2, 0.975),
+    .groups = "drop"
+  ) %>%
+  mutate(significant = ifelse(CI_low > 0 | CI_high < 0, "*", NA))  # Star for significant results
+
+beta_pc2_summary
+prop_sig <- (47-sum(is.na(beta_pc2_summary$significant)))/47
+prop_sig
+```
+
+Add in families and plot:
+
+```{r}
+# Add in families to colour by family 
+beta_pc2_long_fams <- merge(beta_pc2_long, species_fams, by = "Species")
+
+# Clean up environment
+rm(beta_pc2,beta_pc2_chain1, beta_pc2_chain2, beta_pc2_long)
+
+# Plot
+ggplot(beta_pc2_long_fams, aes(x = reorder(Species, Beta_PC2), y = Beta_PC2, fill = Family)) + 
+  geom_boxplot() + 
+  coord_flip() +
+  theme_classic() +
+  scale_colour_grafify(palette = "contrast") +
+  labs(x = "Species", y = "B2")
+```
+
+
+# Plot PC3 Beta parameters 
+
+```{r}
+
+# Identify the column indices for "PC3"
+pc3_indices <- grep("PC3", colnames(mpost[["Beta"]][[1]]))
+
+# Extract Beta estimates for PC3 from both chains
+beta_pc3_chain1 <- as.data.frame(mpost[["Beta"]][[1]][, pc3_indices])
+colnames(beta_pc3_chain1) <- spp_list
+beta_pc3_chain2 <- as.data.frame(mpost[["Beta"]][[2]][, pc3_indices])
+colnames(beta_pc3_chain2) <- spp_list
+
+# Combine data from both chains of MCMC sampling
+beta_pc3 <- bind_rows(beta_pc3_chain1, beta_pc3_chain2, .id = "Chain") %>%
+  .[,2:ncol(.)]
+
+# Convert to long format for ggplot
+beta_pc3_long <- beta_pc3 %>%
+  pivot_longer(cols = everything(), names_to = "Species", values_to = "Beta_PC3")
+```
+
+Calculate 95% CI:
+
+```{r}
+# Calculate 95% CIs
+beta_pc3_summary <- beta_pc3_long %>%
+  group_by(Species) %>%
+  summarise(
+    CI_low = quantile(Beta_PC3, 0.025),
+    CI_high = quantile(Beta_PC3, 0.975),
+    mean = mean(Beta_PC3),
+    .groups = "drop"
+  ) %>%
+  mutate(significant = ifelse(CI_low > 0 | CI_high < 0, "*", NA))  # Star for significant results
+
+beta_pc3_summary
+prop_sig <- (47-sum(is.na(beta_pc3_summary$significant)))/47
+prop_sig
+```
+
+Add in families and plot:
+
+```{r}
+# Add in families to colour by family 
+beta_pc3_long_fams <- merge(beta_pc3_long, species_fams, by = "Species")
+
+# Clean up environment
+rm(beta_pc3,beta_pc3_chain1, beta_pc3_chain2, beta_pc3_long)
+
+# Plot
+ggplot(beta_pc3_long_fams, aes(x = reorder(Species, Beta_PC3), y = Beta_PC3, fill = Family)) + 
+  geom_boxplot() + 
+  coord_flip() +
+  theme_classic() +
+  scale_colour_grafify(palette = "contrast") +
+  labs(x = "Species", y = "B3")
+```
+
+# 8. Gamma parameters (influence of traits on niche)
+
+Now we turn to the gamma parameters, which estimate the effects of species traits on species niches (i.e., how traits influence the Beta parameters - recall that Betas capture species' responses to environmental variables). We have 9 Gamma parameters to look at (3 traits X 3 climate variables).
+
+```{r}
+summary(mpost$Gamma)
+postGamma = getPostEstimate(m, parName = "Gamma")
+plotGamma(m, post=postGamma, param="Sign", supportLevel = 0.90, trNamesNumbers = c(T,F), covNamesNumbers = c(T,F))
+```
+
+The only strongly supported association (>0.90 support) between trait and climate variables is a negative association between trait dimension one and PC1 and PC2 of the climate variables. We can specifically test to see which Gammas are significantly different from zero (90% CI). 
+
+```{r}
+
+# Extract parameter estimates from fitted model 
+get_df <- function(dim_name, distribution){
+  
+  # Get indices where estimates for dimension of interest are found
+  desired_indices <- grep(dim_name, colnames(mpost[[distribution]][[1]]))
+  
+  # Extract parameter estimates for both MCMC chains
+  distr_dim_chain1 <- as.data.frame(mpost[[distribution]][[1]][, desired_indices])
+  distr_dim_chain2 <- as.data.frame(mpost[[distribution]][[2]][, desired_indices])
+  
+  # Combine data from both chains
+  distr_dim <- bind_rows(distr_dim_chain1, distr_dim_chain2, .id = NULL)
+  
+  # Remove "Intercept" columns - not meaningful to interpret ***
+  distr_dim <- distr_dim %>%
+  dplyr::select(-c(grep("Intercept", colnames(distr_dim))))
+  colnames(distr_dim) <- c("PC1", "PC2", "PC3")
+
+  # Convert to long format for ggplot
+  distr_dim_long <- distr_dim %>% 
+  pivot_longer(cols = everything(), names_to = "Influenced_Climate_PC", values_to =
+  paste(distribution, "_Estimate", sep = ""))
+  
+  return(distr_dim_long)
+  
+}
+
+# Organize the gamma estimates in a data frame that ggplot can use
+gamma_dim1_long <- get_df("Dim.1", "Gamma")
+gamma_dim2_long <- get_df("Dim.2", "Gamma")
+gamma_dim3_long <- get_df("Dim.3", "Gamma")
+
+gamma_big_df <- bind_rows(gamma_dim1_long, gamma_dim2_long, gamma_dim3_long, .id = "Trait_Dimension")
+
+# Clean up environment
+rm(gamma_dim1_long, gamma_dim2_long, gamma_dim3_long)
+
+# Calculate 90% CIs
+gamma_summary <- gamma_big_df %>%
+  group_by(Trait_Dimension, Influenced_Climate_PC) %>%
+  summarise(
+    CI_low = quantile(Gamma_Estimate, 0.05),
+    CI_high = quantile(Gamma_Estimate, 0.95),
+    .groups = "drop"
+  ) %>%
+  mutate(significant = ifelse(CI_low > 0 | CI_high < 0, "*", NA))  # Star for significant results
+
+gamma_summary
+```
+
+We can see that none of the gamma parameter estimates are significantly different from zero (90% CI). We can nonetheless visualize the estimates:
+
+```{r}
+# Make box plot
+ggplot(gamma_big_df, aes(x = Trait_Dimension, y = Gamma_Estimate, fill=Influenced_Climate_PC)) + 
+  geom_boxplot() + 
+  theme_classic() +
+  labs(x = "Trait Dimension", y = "Gamma Estimate") +
+    scale_colour_grafify(palette = "contrast")
+```
+
+On to the last parameter!
+
+# 9. Rho parameters (influence of phylogeny on niche)
+
+The Rho coefficient shows the effect of phylogeny on the Beta coefficient (i.e., are species niches phylogenetically correlated), after taking into account the effect of traits. 
+
+```{r}
+summary(mpost$Rho)
+```
+
+Here we see a very weak phylogenetic signal in species niches (i.e., 95% CI includes zero), suggesting that the effect of phylogeny may be captured by the inclusion of traits in the model.
+
+# 10. Residual associations
+
+Let us next visualize the estimated residual associations among the species. These are species co-occurrences that occur more (or less) than would be expected due to random chance, after controlling for the fixed effects (climate variables). 
+
+```{r}
+OmegaCor = computeAssociations(m)
+supportLevel = 0.95
+toPlot = ((OmegaCor[[1]]$support>supportLevel) 
+          + (OmegaCor[[1]]$support<(1-supportLevel))>0)*OmegaCor[[1]]$mean
+corrplot(toPlot, method = "color", 
+         col=colorRampPalette(c("blue","white","red"))(200),
+         tl.cex=.6, tl.col="black",
+         title=paste("random effect level:", m$rLNames[1]), mar=c(0,0,1,0), 
+         order = "original")
+```
+
+Convert to dataframe format:
+
+```{r}
+toPlot[lower.tri(toPlot, diag = TRUE)] <- NA
+toPlot.col<-melt(toPlot)
+colnames(toPlot.col)<-c("Species 1","Species 2","Residual_Association")
+toPlot.col <- na.omit(toPlot.col)
+```
+
+How many species-pairs show strongly supported positive associations (residual correlations)?
+
+```{r}
+sum(toPlot.col$Residual_Association>0)
+sum(toPlot.col$Residual_Association>0)/nrow(toPlot.col)
+```
+
+How many species-pairs show strongly supported negative associations (residual correlations)?
+
+```{r}
+sum(toPlot.col$Residual_Association<0)
+sum(toPlot.col$Residual_Association<0)/nrow(toPlot.col)
+```
+
+How many species-pairs show no strongly supported associations (residual correlations)?
+
+```{r}
+sum(toPlot.col$Residual_Association==0)
+sum(toPlot.col$Residual_Association==0)/nrow(toPlot.col)
+```
+
+
+# HMSC Resources
+
+User-friendly guide to using HMSC for variance partitioning analysis of pollinator assemblages: https://bookdown.org/felipetorresvanegas_mail/hmsc_vp_workshop/_book/. 
+HMSC vignettes by the creators of the HMSC package: 
+https://github.com/hmsc-r/HMSC

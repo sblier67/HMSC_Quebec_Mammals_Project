@@ -1,0 +1,683 @@
+Siena Blier
+F24/W25 Honours Biology Research Project
+Hmsc Input Data (includes: species distribution, trait, phylogentic, and climate)
+
+# PART A: SPECIES DISTRIBUTION DATA ---------------------------------------
+
+# 0. Load libraries -------------------------------------------------------
+
+```{r}
+
+# General
+library(dplyr)
+library(ggplot2)
+
+# For shapefiles
+library(sf)
+library("rnaturalearth")
+library("rnaturalearthdata")
+library(terra)
+library(letsR)
+library(raster)
+
+# For data cleaning and analysis
+library(VIM)
+library("robustbase")
+library("FactoMineR")
+library(stats)
+library(factoextra)
+
+# For phylogenetic data
+library(ape)
+library(phytools)
+library(terra)
+
+# Data vis
+library(ggpubr)
+```
+
+# 1. Get list of species --------------------------------------------------
+
+We will use the "List of Vertebrate Fauna in Quebec" (https://open.canada.ca/data/en/dataset/9b779078-1fd1-4492-8bbe-0892b0d13192) to obtain a list of terrestrial, non-volant mammals present in Quebec. 
+
+```{r}
+# Get list of animals and keep only mammals
+opgov_mammals <- read.csv("LFVQ_spp.csv") %>%
+  filter(., GRAND_GROUPE == "Mammif\xe8res")
+opgov_list <-unique(opgov_mammals$Nom_scientifique) # Get list of unique names of species
+```
+
+Now we will use the COMBINE database (https://esajournals.onlinelibrary.wiley.com/doi/10.1002/ecy.3344) to keep only terrestrial (non-aquatic, non-marine), non-volant mammals. 
+
+```{r}
+# Filter COMBINE with list of species
+all_traits <- read.csv("COMBINE/COMBINE_archives/trait_data_imputed.csv") %>%
+  as.data.frame()
+
+# Check which species are missing in COMBINE (often due to naming discrepancies)
+setdiff(opgov_list, all_traits$iucn2020_binomial)
+```
+
+We correct the discrepancies and clean up our list: 
+
+```{r}
+# Correct names in opgov_list
+corr_opgov_list <- recode(opgov_list,
+                     "Sorex gaspensis" = "Sorex dispar",
+                     "Tamias minimus" = "Neotamias minimus", 
+                     "Vison vison" = "Neovison vison",
+                     "Pekania pennanti" = "Martes pennanti",
+                     "Rangifer tarandus caribou" = "Rangifer tarandus",
+                     "Glaucomys volans pop. 1" = "Glaucomys volans",
+)
+
+# Remove other species (eg. marine, duplicates of populations, etc.)
+to_remove <- setdiff(corr_opgov_list, all_traits$iucn2020_binomial)
+corr_opgov_list_2 <- setdiff(corr_opgov_list, to_remove)
+
+# Use corrected list of species and COMBINE to keep only terrestrial non-volant, non-marine, non-aquatic mammals
+tnv_traits <- filter(all_traits, iucn2020_binomial %in% corr_opgov_list_2) %>%
+  filter(., terrestrial_non.volant == 1, freshwater == 0, marine == 0)
+
+spp_list <- unique(tnv_traits$iucn2020_binomial)
+spp_list
+```
+
+List looks good! Let's save it:
+
+```{r}
+saveRDS(spp_list, "Saved Files FINAL/spp_list.rds")
+```
+
+# 2. Process Species shapefiles ---------------------------------------
+
+Now, we will use our preliminary* list of species to build our PA matrix. First, we need a map of our region of interest. 
+
+*I say "preliminary" because later we will exclude "rare" and "ubiquitous" species from our model. 
+
+```{r}
+
+# Download Canadian provinces' shapefiles
+provinces <- ne_states(c("Canada"), returnclass = "sf")
+
+# Filter Candaian map to Region of Interest (ROI)
+regions_of_interest <- c("Québec", "Newfoundland and Labrador")
+
+filtered_regions <- provinces[provinces$name %in% regions_of_interest, ]
+
+# Check: Plot ROI 
+ggplot() +
+  geom_sf(data = filtered_regions, fill = NA, color = "black") +
+  theme_minimal() +
+  labs(title = "Study Area")
+```
+
+Map looks good! Let's save those shapefiles:
+
+```{r}
+# Save filtered shapefile
+st_write(filtered_regions, "Saved Files FINAL/filtered_regions.shp", append = FALSE)
+roi <- st_read("Saved Files FINAL/filtered_regions.shp")
+```
+
+Now, we load the species shapefiles downloaded from the IUCN Red List data base. Shapefiles for all **terrestrial mammals** were downloaded (https://www.iucnredlist.org/resources/spatial-data-download), and then filtered to our species of interest.
+
+```{r}
+
+# Load shapefiles
+terr_mamm_shp <- st_read("MAMMALS_TERRESTRIAL_ONLY/MAMMALS_TERRESTRIAL_ONLY.shp")
+
+# Check that ROI and IUCN shapefiles are in same coordinate system (WGS-84)
+st_crs(terr_mamm_shp)
+st_crs(roi) 
+```
+
+Now, we use our species list to keep only the shapefiles for our species of interest, 
+and check that no species are missing. 
+
+```{r}
+# Keep only species of interest
+terr_mamm_filtered_shp <- terr_mamm_shp[terr_mamm_shp$sci_name %in% spp_list,]
+
+# Check missing species
+setdiff(spp_list, unique(terr_mamm_filtered_shp$sci_name)) 
+```
+
+This revealed that I needed to address some naming discrepancies:
+- change Myodes gapperi to Clethrionomys gapperi
+- change Mustela frenata to Neogale frenata
+
+```{r}
+# List with corrected names
+spp_list_IUCN <- recode(spp_list,
+                        "Myodes gapperi" = "Clethrionomys gapperi",
+                        "Mustela frenata" = "Neogale frenata")
+
+# Filter with corrected list
+terr_mamm_filtered_shp <- terr_mamm_shp[terr_mamm_shp$sci_name %in% spp_list_IUCN,]
+                    
+# Check missing species
+setdiff(spp_list_IUCN, unique(terr_mamm_filtered_shp$sci_name)) 
+```
+
+We now have shapefiles for all our species of interest. There are 55 species in our 
+corrected species list (spp_list_IUCN), and 249 observations (species) in our filtered shapefile
+(terr_mamm_filtered_shp). This could mean that for a given species, there are separate entries for
+different **subpopulations** or **subspecies** within a given species. Since we only care about diversity at the species level, we will group entries by species. 
+
+```{r}
+# Group subspecies together
+sf_use_s2(FALSE) # use flat space geometry, avoids bugs later
+terr_mamm_grouped_shp <- terr_mamm_filtered_shp %>%
+  group_by(sci_name) %>% 
+  dplyr::summarise(geometry = st_union(geometry))
+```
+
+We can now trim the grouped shapefiles to our ROI. First, we merge the two shapes in the ROI shapefile to facilitate the intersection function used later. 
+
+```{r}
+roi_merged <- st_union(roi) # Merge Qc and NFL into one shape
+
+# Trim IUCN shapefiles to ROI
+terr_mamm_trimmed_shp <- st_intersection(terr_mamm_grouped_shp, roi_merged)
+
+# Visualize overlap of spp distr and ROI basemap
+ggplot() +
+  geom_sf(data = roi, fill = "gray90", color = "black") +
+  geom_sf(data = terr_mamm_trimmed_shp, aes(fill = sci_name), color = NA, alpha = 0.1) +
+  theme_minimal() +
+  labs(title = "Species Distributions in Region of Interest",
+       fill = "Species")
+
+# Check missing species
+missing_spp <- setdiff(spp_list_IUCN, terr_mamm_trimmed_shp$sci_name)
+missing_spp
+```
+
+The above plot isn't really meaningful or interpretable, but it helps us see that our shapefiles indeed cover our region of interest, meaning that the trimming step worked. We see that three species are **missing** from our trimmed shapefiles - Neotamias minimus, Puma concolor, Rattus norvegicus. We can use the following chunk of code to visualize each species in turn (simply change the sci_name for the species you want to visualize). 
+
+```{r}
+ggplot() +
+  geom_sf(data = roi, fill = NA, color = "black") +
+  geom_sf(data = terr_mamm_grouped_shp[terr_mamm_grouped_shp$sci_name == "Rattus norvegicus", ], 
+          fill = "red", color = "red", alpha = 0.5) +
+  theme_minimal() +
+  labs(title = "Neotamias Distribution Over Study Area")
+```
+
+We can see that the shapefiles for these species don't actually overlap with our ROI, so it's not problematic that we don't include them. However, we need to update our species list. We can now also save our trimmed shapefiles: 
+
+```{r}
+
+spp_list_IUCN_updated <- terr_mamm_trimmed_shp$sci_name
+
+# Save shapefiles of species ranges
+st_write(terr_mamm_trimmed_shp, "Saved Files FINAL/species_ranges.shp", append = FALSE, delete_layer = TRUE)
+# Load files
+species_ranges <- st_read("Saved Files FINAL/species_ranges.shp")
+
+```
+
+These processed shapefiles are now ready to be used to create a presence-absence matrix of our species of interest, which is what gets input into our model. 
+
+# 3. Make Presence-Absence Matrix ---------------------------------------
+
+We will make our presence-absence matrix using the lets.presab function from the letsR package (https://cran.r-project.org/web/packages/letsR/vignettes/A-guide-to-transform-species-distributions-into-a-presence-absence-matrix-based.html). This function essentially overlays the species shapefiles on a user-defined grid, then assigns a value of 1 (presence) for a species in a given grid cell if the species' shape file overlaps with that grid cell (value of 0 otherwise). For consistency, we will use the same resolution as the climate data from WorldClim (10 arcmin; see PART D). Note: This takes upt to a few hours to run. 
+
+```{r}
+
+# Get the bounding box of the study region
+bbox <- st_bbox(roi_merged)
+bbox
+
+# PA-Mat for 10 min res
+pa_matrix <- letsR::lets.presab(
+  species_ranges,
+  xmn = bbox[[1]], xmx = bbox[[3]],
+  ymn = bbox[[2]], ymx = bbox[[4]],
+  resol = 0.1666667, count = TRUE, 
+  show.matrix = TRUE
+)
+```
+
+We can plot the PA matrix to ensure it covers the ROI fully:
+
+```{r}
+pa_matrix_df <- pa_matrix %>% 
+  as.data.frame()
+
+pa_matrix_df <- rename(pa_matrix_df, Longitude = "Longitude(x)", Latitude = "Latitude(y)")
+rownames(pa_matrix_df) <- 1:nrow(pa_matrix_df)
+
+# Change Clethrionomys gapperi back to Myodes gapperi and Neogale frenata to Mustela frenata (so that they match COMBINE and PHYLACINE naming)
+colnames(pa_matrix_df)[colnames(pa_matrix_df) == "Clethrionomys gapperi"] <- "Myodes gapperi"
+colnames(pa_matrix_df)[colnames(pa_matrix_df) == "Neogale frenata"] <- "Mustela frenata"
+
+colnames(pa_matrix_df) # Check
+```
+
+Names look good! Proceed to visualizing matrix:
+
+```{r}
+ggplot() +
+  geom_sf(data = roi, fill = "lightgreen", alpha = 0.5) +
+  geom_point(aes(x = pa_matrix_df$`Longitude(x)`, y = pa_matrix_df$`Latitude(y)`), color = "blue", size = 2) +
+  labs(title = "Grid Cells Over Region of Interest", x = "Longitude", y = "Latitude")
+```
+
+Our PA matrix seems to cover the entire ROI, which is perfect! We also check that no species are missing from the matrix: 
+
+```{r}
+setdiff(spp_list_IUCN_updated, unique(colnames(pa_matrix_df)))
+```
+
+All of the 52 species are present in the matrix! Lastly, we can plot species richness (SR) over our ROI to see if our data follows expected trends:
+
+```{r}
+# Calculate SR with PA matrix
+species_richness <- as.data.frame(rowSums(pa_matrix[, -(1:2)])) # ignore lat/long columns 
+
+# Make data frame with coordinates and SR values for each site
+sr_df <- as.data.frame(cbind(Longitude = pa_matrix_df$Longitude, Latitude = pa_matrix_df$Latitude, SR = species_richness$`rowSums(pa_matrix[, -(1:2)])`))
+
+# Plot SR over ROI
+ggplot() +
+  geom_sf(data = roi, fill = "lightgray", color = "black") +
+  geom_point(data = sr_df, aes(x = Longitude, y = Latitude, color = SR), size = 2) +
+  scale_color_viridis_c() + 
+  labs(title = "Species Richness Across ROI", x = "Longitude", y = "Latitude", color = "SR") +
+  theme_classic() +
+  theme(legend.position = "right")
+```
+
+Looks as expected (right shape of ROI, SR decreasing with latitude). Save the presence-absence matrix:
+
+```{r}
+saveRDS(pa_matrix_df, file = "Saved Files FINAL/pa_matrix_df.rds")
+pa_matrix_df <- readRDS("Saved Files FINAL/pa_matrix_df.rds")
+```
+
+To reduce computational load, we will take a random sample of 150 points from our presence-absence matrix (as was done in Cranston et al., 2024).
+
+```{r}
+
+set.seed(5) #for reproducibility
+pa_matrix_sample <- pa_matrix_df[sample(nrow(pa_matrix_df),150), ]
+
+# Visualize sample points on ROI 
+ggplot() +
+  geom_sf(data = roi, fill = "lightgray", color = "black") +
+  geom_point(data = pa_matrix_sample, aes(x = Longitude, y = Latitude), size = 2) +
+  labs(title = "Sample Sites", x = "Longitude", y = "Latitude") +
+  theme_minimal() +
+  theme(legend.position = "right")
+```
+
+We see that there is good coverage of the entire region of interest. Now, we want to remove species that are either present in less than 2.5% of the sites in our PA-matrix (rare species) or that are present in more than 97.5% of the sites (ubiquitous species). HMSC has more difficulty predicting rare species, and MCMC convergence is more difficult when rare species are included in the model (Ovaskainen and Abrego, 2020). 
+
+```{r}
+
+# Remove lat and long columns 
+just_pa_matrix_sample <- pa_matrix_sample[,3:(ncol(pa_matrix_sample))]
+
+# Calculate proportion of "presence" (value of 1 in PA-matrix) for species 
+spp_proportions <- colSums(just_pa_matrix_sample)/nrow(just_pa_matrix_sample)
+
+# Remove rare and ubiquitous species
+nonrare_spp <- spp_proportions >= 0.025 & spp_proportions <= 0.975
+pa_matrix_nonrare <- just_pa_matrix_sample[, which(nonrare_spp)]
+
+nonrare_spp_list <- colnames(pa_matrix_nonrare)
+saveRDS(nonrare_spp_list, file = "Saved Files FINAL/nonrare_spp_list.rds") # save list
+
+setdiff(colnames(just_pa_matrix_sample), nonrare_spp_list)
+```
+
+Now that we've removed the rare and ubiquitous species (Didelphis virginiana, Microtus pinetorum, Sorex dispar, Urocyon cinereoargenteus, Vulpes Vulpes), we have 47 species in our model. Now we save this filtered presence-absence matrix because it's what we will input in the HMSC model. We also save a data frame of the coordinates for the sampled sites for later use in HMSC. 
+
+```{r}
+saveRDS(pa_matrix_nonrare, "Saved Files FINAL/pa_matrix_input.rds")
+
+site_coords <- data.frame(
+  SiteID = rownames(pa_matrix_sample),
+  Longitude = pa_matrix_sample$Longitude,
+  Latitude = pa_matrix_sample$Latitude
+)
+saveRDS(site_coords, file = "Saved Files FINAL/site_coords.rds")
+site_coords <- readRDS("Saved Files FINAL/site_coords.rds")
+```
+
+# PART B: TRAIT DATA ---------------------------------------
+
+As before, we are using the COMBINE database, but this time to obtain our species trait data (https://esajournals.onlinelibrary.wiley.com/doi/10.1002/ecy.3344). We also need to make sure the data types are correct (e.g., binary, numeric, categorical) - this is especially important for the kNN imputation we will carry out to fill in missing values. 
+
+```{r}
+
+# Load data
+all_traits <- read.csv("COMBINE/COMBINE_archives/trait_data_imputed.csv")
+
+# Keep only species of interest
+nonrare_spp_list <- readRDS("Saved Files FINAL/nonrare_spp_list.rds")
+all_traits_filtered <- filter(all_traits, all_traits$iucn2020_binomial %in% nonrare_spp_list)
+
+setdiff(nonrare_spp_list, all_traits_filtered$iucn2020_binomial) # Check no missing species 
+
+# Keep only traits of interest
+traits <- dplyr::select(all_traits_filtered, iucn2020_binomial, adult_mass_g, trophic_level, litter_size_n, activity_cycle, home_range_km2, foraging_stratum, hibernation_torpor)
+glimpse(traits)
+
+# Remove IUCN name column (make it row names)
+rownames(traits) <- traits$iucn2020_binomial
+traits <- traits[,-1]
+
+# Fix data types
+
+# Trophic level
+traits$trophic_level <- factor(traits$trophic_level, 
+                           levels = c(1, 2, 3), 
+                           labels = c("herbivore", "omnivore", "carnivore"), 
+                           ordered = TRUE)
+# Activity cycle
+traits$activity_cycle <- factor(traits$activity_cycle, 
+                            levels = c("1", "2", "3"), 
+                            ordered = TRUE)
+
+# Foraging stratum
+traits$foraging_stratum <- factor(traits$foraging_stratum, 
+                              levels = c("M", "G", "S", "AR", "A"), 
+                              ordered = TRUE)
+
+# Hibernation/torpor
+
+traits$hibernation_torpor <- as.logical(traits$hibernation_torpor)
+
+# Check
+str(traits)
+```
+
+There are some missing (NA) values in our trait matrix, which we will handle using k-nearest neighbour (kNN) imputation from R package VIM (https://cran.r-project.org/web/packages/VIM/index.html).
+
+```{r}
+
+traits_clean <- traits %>%
+  kNN() %>%
+  dplyr::select(1:7) # kNN adds a logical column for each variable indicating if imputation was used on that column 
+
+# Add row names back in 
+rownames(traits_clean) <- rownames(traits)
+
+# Check
+sum(is.na(traits_clean))
+glimpse(traits_clean)
+```
+
+There are no missing values and we still have the right variables and data types. It's ready to save!
+
+```{r}
+saveRDS(traits_clean, file = "Saved Files FINAL/traits_clean.rds")
+traits_clean <- readRDS("Saved Files FINAL/traits_clean.rds")
+```
+
+To address multicollinearity and reduce computational load, we will reduce the dimensionality of the trait data (seven traits to three dimensions). We will do this using the FAMD function from FactoMineR (https://cran.r-project.org/web/packages/FactoMineR/index.html), which can handle the different types of data in our trait matrix (continuous, ordinal, binary). 
+
+```{r}
+famd_result <- FAMD(traits_clean, ncp = 3)  # returns loadings plot
+famd_result$eig # to look at cumulative proportion of variance explained
+```
+
+The first three components explain most of the variation (~60%). Save results:
+
+```{r}
+saveRDS(famd_result, file = "Saved Files FINAL/famd_result.rds")
+famd_result <- readRDS("Saved Files FINAL/famd_result.rds")
+```
+
+Visualize the results:
+
+```{r}
+
+# First looking at the variables (change axes argument as needed)
+fviz_famd_var(famd_result, choice = "var", geom = c("arrow", "text"), repel = TRUE,
+              col.var = "contrib", axes = c(1, 2),
+              gradient.cols = c("black", "orange", "red")) + labs(title = NULL) + 
+  theme_classic()
+```
+
+Examine variables' contributions to the dimensions: 
+
+```{r}
+famd_contribs <- as.data.frame(famd_result[["var"]][["contrib"]])
+```
+
+*Dimensions 1* is explained mostly by litter size, trophic level and adult mass (i.e., life history, resource use). 
+*Dimension 2* is explained mostly by trophic level, activity cycle and hibernation/torpor (i.e., resource use and diapausing strategy)
+*Dimension 3* is explained mostly by foraging stratum, activity cycle and home range (closely followed by litter size) (i.e., resource use and life history). 
+
+Look at where a subsample of individuals lie along the axes: 
+
+```{r}
+# Looking at 1st and 2nd dimension (change axes argument as needed)
+famd_plot <- fviz_famd(famd_result, axes = c(1,2), repel = TRUE,
+               geom = c("point", "text"), 
+               col.ind = "blue", 
+               select.ind = list(name = c("Ursus americanus", "Zapus hudsonius", "Alces alces", "Canis latrans")),
+               invisible = "quali.var") + 
+  theme_classic()
+
+ggpar(famd_plot, xlim = c(-3, 6), ylim = c(-3, 4)) # Adjust these values as needed
+
+```
+
+To input this reduced-dimension data in HMSC, we want the scores of each species for the three most important dimensions.
+
+```{r}
+trait_scores <- data.frame(famd_result[["ind"]][["coord"]][, 1:3])
+
+# Make sure order of the species in the trait matrix matches the order in PA matrix)
+trait_scores_ordered <- trait_scores[nonrare_spp_list,]
+rownames(trait_scores_ordered)
+
+# Save for input in HMSC
+saveRDS(trait_scores_ordered, file = "Saved Files FINAL/trait_input.rds")
+```
+
+# PART C: PHYLOGENETIC DATA ---------------------------------------
+
+HMSC can account for phylogenetic relationships, so we build a phylogenetic correlation matrix for input in our model. We start by loading phylogenetic trees (n = 1000) from the PHYLACINE database (https://megapast2future.github.io/PHYLACINE_1.2/).
+
+```{r}
+# Load phylogenetic trees
+treedata <- "PHYLACINE/Phylogenies/Complete_phylogeny.nex"
+trees <- ape::read.nexus(treedata)
+```
+
+Next we prune the trees to only keep our species of interest.
+
+```{r}
+nonrare_spp_list <- readRDS("Saved Files FINAL/nonrare_spp_list.rds")
+
+# Reformat names to match Phylacine
+phyla_spp_list <- nonrare_spp_list %>%
+  gsub(" ", "_", .)
+
+# Prune each tree to species of interest
+pruned_trees <- lapply(trees, function(tree) {
+  drop.tip(tree, setdiff(tree$tip.label, phyla_spp_list))
+})
+
+# Check for missing species
+all_species_in_trees <- unique(unlist(lapply(pruned_trees, function(tree) tree$tip.label)))
+setdiff(all_species_in_trees, phyla_spp_list)
+```
+
+There are no species missing our trees! We can look at one tree as an example:
+
+```{r}
+plot(pruned_trees[[1]])
+```
+
+Looks good! Now we save the pruned trees. 
+
+```{r}
+write.nexus(pruned_trees, file = "Saved Files FINAL/pruned_trees.nex")
+pruned_trees <- read.nexus("Saved Files FINAL/pruned_trees.nex")
+```
+
+We can also make a consensus tree to show the evolutionary relatedness of our species of interest. 
+
+```{r}
+consensus_tree <- consensus(pruned_trees, p = 1, rooted = TRUE)  # Strict consensus w/p = 1
+plot(consensus_tree, main = "Consensus Tree",  cex = 0.35)
+```
+
+Now it's time to make our phylogenetic correlation matrix. We first make a variance-covariance matrix, and then normalize it to create a correlation matrix. We make a correlation matrix for each of the pruned trees (n=1000), and then average the matrices (this average is what we will input in HMSC)
+
+```{r}
+
+# phylo corr matrix for each pruned tree
+get_phylo_correlation <- function(tree) {
+  # Compute the variance-covariance matrix
+  vcv_matrix <- vcv(tree)
+  # Normalize to create a correlation matrix
+  cor_matrix <- cov2cor(vcv_matrix)
+  return(cor_matrix)
+}
+
+# Apply to all pruned trees
+correlation_matrices <- lapply(pruned_trees, get_phylo_correlation)
+
+# Average the matrices
+phylo_input <- Reduce("+", correlation_matrices) / length(correlation_matrices)
+
+# Visualize
+heatmap(phylo_input, main = "Phylogenetic Corr Matrix")
+```
+
+Now we fix some formatting details so the matrix can be used to by HMSC  
+
+```{r}
+
+# Replace underscores "_" with spaces " "
+colnames(phylo_input) <- gsub("_", " ", colnames(phylo_input))
+rownames(phylo_input) <- gsub("_", " ", rownames(phylo_input))
+
+# Reorder to match non_rare_spp list
+phylo_input_df <- as.data.frame(phylo_input)
+phylo_input_df <- phylo_input_df[nonrare_spp_list, nonrare_spp_list]
+
+heatmap(as.matrix(phylo_input), main = "Phylogenetic Corr Matrix") # Check!
+```
+
+Looks good! Save:
+
+```{r}
+# Save matrix
+saveRDS(phylo_input_df, file = "Saved Files FINAL/phylo_input.rds")
+phylo_input <- readRDS("Saved Files FINAL/phylo_input.rds")
+```
+
+# PART D: CLIMATE DATA ---------------------------------------
+
+We downloaded the 19 bioclimatic variables from the WorldClim database at 10min resolution (https://www.worldclim.org/data/worldclim21.html). 
+
+
+```{r}
+# Load WorldClim tif files
+climate_rasters <- rast(list.files("wc2", pattern = "\\.tif$", full.names = TRUE)) 
+
+# Load shapefile of region of interest
+roi <- st_read("Saved Files FINAL/filtered_regions.shp")
+
+# SiteIDs
+site_coords <- readRDS("Saved Files FINAL/site_coords.rds")
+```
+
+First we check that the climate rasters are in the same CRS as our site coordinates (WGS-84).
+
+```{r}
+crs(climate_rasters)
+```
+
+They are in the right CRS, so there's no need to reproject. Now we can extract the climate data for our study sites using the terra package (https://cran.r-project.org/web/packages/terra/index.html). 
+
+```{r}
+long_lat <- site_coords[,-1]
+climate_values <- terra::extract(climate_rasters, long_lat) %>%
+  .[,-1] # remove extra ID column 
+
+rownames(climate_values) <- site_coords$SiteID # Label each row with Site ID
+
+colnames(climate_values) <- gsub("^wc2.1_10m_", "", colnames(climate_values))
+
+```
+
+Now we can prepare the climate data for input in HMSC. As with the species trait data, we are reducing the dimensionality of the climate data with a Principal Component Analysis (PCA), keeping the scores of each sampled site for the three most important PC's. 
+
+```{r}
+# Check for missing values
+sum(is.na(climate_values))
+```
+
+Since there are no missing values, we can proceed with the PCA. 
+
+```{r}
+
+climate_pca <- prcomp(climate_values, scale. = TRUE)  # scale data bc variables are in different units
+summary(climate_pca)
+```
+
+The first three components account for almost 90% of the variance. Now we can build a loading plot where arrows will be coloured by type of variable (temperature or precipitation):
+
+```{r}
+# Assign each variable as in the "Temperature" or "Precipitation" category
+temp_varis <- c("bio_1", "bio_10", "bio_11", "bio_2", "bio_3", "bio_4", "bio_5", "bio_6", "bio_7", "bio_8", "bio_9")
+precipitation_varis <- c("bio_12", "bio_13", "bio_14", "bio_15", "bio_16", "bio_17", "bio_18", "bio_19")
+variable_type <- c(rep("Temperature", length(temp_varis)), rep("Precipitation", length(precipitation_varis)))
+names(variable_type) <- c(temp_varis, precipitation_varis)
+variable_type <- variable_type[colnames(climate_values)] # Reorder variables to match climate_values
+
+# Change "axes" argument to see different PCs
+fviz_pca_var(climate_pca, 
+             select.var = list(contrib = 10),
+             col.var = variable_type,
+             axes = c(1, 3),
+             palette = c("Temperature" = "darkred", "Precipitation" = "royalblue"),
+             repel = TRUE,
+             legend.title = "Variable Type") + theme_classic() + labs(title = NULL)
+
+```
+
+Prepare the data for input in HMSC: 
+
+```{r}
+# Extract the PCA scores
+pca_scores <- climate_pca$x[, 1:3] %>%
+  as.data.frame()
+
+saveRDS(pca_scores, "Saved Files FINAL/climate_input.rds")
+climate_input <- readRDS("Saved Files FINAL/climate_input.rds")
+```
+
+We can also visualize the coordinates of the 150 sample sites for the three PCs:
+
+```{r}
+# Make a data frame with PCA scores and lagitude/longitude coordinates of sites
+pca_scores_coords <- pca_scores
+pca_scores_coords$Longitude <- site_coords$Longitude
+pca_scores_coords$Latitude <- site_coords$Latitude
+
+# Convert to long format
+pca_scores_coords <- pca_scores_coords %>%
+  pivot_longer(cols = starts_with("PC"), names_to = "PC", values_to = "Score")
+
+# Plot site scores for 3 PCs on ROI
+ggplot() +
+  geom_sf(data = roi, fill = "lightgrey", alpha = 0.5) +
+  geom_point(data = pca_scores_coords, aes(x = Longitude, y = Latitude, color = Score), size = 1) +
+  scale_color_viridis_c() +
+  facet_wrap(~ PC) +
+  labs(title = "PCA Scores of Sample Sites", x = "Longitude", y = "Latitude") +
+  theme_classic()
+```
+
+We made it! We now have our species distribution data, trait data, phylogenetic data and climate data ready to be input in HMSC. See you in the next script, where we build and run our model! 
